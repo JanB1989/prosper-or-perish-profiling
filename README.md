@@ -34,6 +34,39 @@ uv run pp-profile profiling-roots analyze \
   --output reports/profiling_roots.md
 ```
 
+Write a standalone HTML visualization alongside the Markdown report:
+
+```bash
+uv run pp-profile profiling-roots analyze \
+  --output reports/profiling_roots.md \
+  --html-output reports/profiling_roots.html \
+  --json-output reports/profiling_roots.metadata.json
+```
+
+The HTML view breaks the whole log down by total impact, Bottleneck Time
+blocking pressure, call volume, ownership, and mod-owned systems such as
+building capacity formulas, building definitions, employment priorities, and
+on-action/culling logic. Its mod file and mod row drill-down tables include all
+resolved mod-owned entries from the export, with seconds plus percent-of-all
+and percent-of-mod columns. When `logs/performance_degradation.log` is present
+next to the profiling CSV, the HTML report also includes elapsed-time and
+frame/update-delta statistics with an inline graph. Markdown and HTML reports
+also include rural-capacity callsite rollups, building surface breakdowns,
+fruit-orchard focus tables, and likely duplicate `max_levels`/`allow` capacity
+evaluations. The JSON sidecar stores machine-readable run metadata, including
+CSV file stats, performance-log sample count, elapsed seconds, estimated
+frames/ticks, game-date span, frame/update deltas, memory, GUI widget, and ECS
+summaries when those columns are present.
+
+Compare two profiling captures:
+
+```bash
+uv run pp-profile profiling-roots diff \
+  --before-csv reports/before/profiling_roots.csv \
+  --after-csv reports/after/profiling_roots.csv \
+  --output reports/profiling_roots_diff.md
+```
+
 Analyze a specific CSV:
 
 ```bash
