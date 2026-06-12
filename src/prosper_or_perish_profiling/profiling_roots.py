@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import html
 import json
 import os
@@ -10,7 +11,7 @@ import re
 import tomllib
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path, PureWindowsPath
 from typing import Iterable, Mapping, Sequence
 
@@ -66,6 +67,16 @@ RURAL_CAPACITY_BUILDING_SURFACES = {
     "allow block",
     "capacity gate",
 }
+GAME_DATE_RE = re.compile(
+    r"^(?P<year>\d+)_(?P<month>\d{1,2})_(?P<day>\d{1,2})$"
+)
+HISTORY_SCHEMA_VERSION = 1
+HISTORY_WATCHED_BLOCKS = (
+    "farm_capacity",
+    "forest_capacity",
+    "fish_capacity",
+    "fruit_orchard",
+)
 
 
 @dataclass(frozen=True)
@@ -149,6 +160,7 @@ class AnalysisResult:
     top_rows: tuple[ProfilingRow, ...]
     top_files: Mapping[str, tuple[FileAggregate, ...]]
     mod_hotspots: tuple[FileAggregate, ...]
+    performance_log_path: Path | None = None
     performance_series: PerformanceSeries | None = None
     generated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
@@ -220,6 +232,19 @@ class DuplicateCapacityEvaluation:
 
 
 @dataclass(frozen=True)
+class GameDate:
+    raw: str
+    year: int
+    month: int
+    day: int
+    ordinal: int
+
+    @property
+    def is_bootstrap(self) -> bool:
+        return self.year == 1
+
+
+@dataclass(frozen=True)
 class PerformanceSample:
     total_time: float
     average_delta: float
@@ -227,6 +252,15 @@ class PerformanceSample:
     max_delta: float
     game_date: str
     extra_values: Mapping[str, float] = field(default_factory=dict)
+
+    @property
+    def parsed_game_date(self) -> GameDate | None:
+        return parse_game_date(self.game_date)
+
+    @property
+    def is_gameplay_sample(self) -> bool:
+        parsed = self.parsed_game_date
+        return parsed is not None and not parsed.is_bootstrap
 
 
 @dataclass(frozen=True)
@@ -271,7 +305,71 @@ class PerformanceSeries:
         return max(sample.max_delta for sample in self.samples)
 
     @property
-    def estimated_frames_or_ticks(self) -> float:
+    def gameplay_samples(self) -> tuple[PerformanceSample, ...]:
+        return tuple(sample for sample in self.samples if sample.is_gameplay_sample)
+
+    @property
+    def gameplay_speed_samples(self) -> tuple[PerformanceSample, ...]:
+        samples = self.gameplay_samples
+        if len(samples) < 2:
+            return samples
+        final_date = samples[-1].parsed_game_date
+        if final_date is None:
+            return samples
+        for index, sample in enumerate(samples):
+            if sample.parsed_game_date == final_date:
+                return samples[: index + 1]
+        return samples
+
+    @property
+    def bootstrap_sample_count(self) -> int:
+        return len(self.samples) - len(self.gameplay_samples)
+
+    @property
+    def gameplay_start_date(self) -> str:
+        samples = self.gameplay_speed_samples
+        return samples[0].game_date if samples else ""
+
+    @property
+    def gameplay_end_date(self) -> str:
+        samples = self.gameplay_speed_samples
+        return samples[-1].game_date if samples else ""
+
+    @property
+    def gameplay_elapsed_seconds(self) -> float:
+        samples = self.gameplay_speed_samples
+        if len(samples) < 2:
+            return 0.0
+        return max(0.0, samples[-1].total_time - samples[0].total_time)
+
+    @property
+    def game_days_elapsed(self) -> int:
+        samples = self.gameplay_speed_samples
+        if len(samples) < 2:
+            return 0
+        start = samples[0].parsed_game_date
+        end = samples[-1].parsed_game_date
+        if start is None or end is None:
+            return 0
+        return max(0, end.ordinal - start.ordinal)
+
+    @property
+    def seconds_per_game_day(self) -> float:
+        return _safe_div(self.gameplay_elapsed_seconds, self.game_days_elapsed)
+
+    @property
+    def game_days_per_second(self) -> float:
+        return _safe_div(float(self.game_days_elapsed), self.gameplay_elapsed_seconds)
+
+    @property
+    def mean_gameplay_average_delta(self) -> float:
+        samples = self.gameplay_speed_samples
+        if not samples:
+            return 0.0
+        return sum(sample.average_delta for sample in samples) / len(samples)
+
+    @property
+    def estimated_frames_or_updates(self) -> float:
         return sum(
             _safe_div(_sample_duration(self.samples, index), sample.average_delta)
             for index, sample in enumerate(self.samples)
@@ -305,6 +403,7 @@ class PerformanceSeries:
 def analyze_profiling_roots(
     *,
     csv_path: Path | None = None,
+    performance_log_path: Path | None = None,
     user_data_root: Path | None = None,
     load_order_path: Path | None = None,
     mod_roots: Sequence[Path] = (),
@@ -323,6 +422,11 @@ def analyze_profiling_roots(
     resolved_csv = _resolve_csv_path(csv_path, resolved_user_data_root)
     if not resolved_csv.is_file():
         raise AnalysisError(f"profiling CSV not found: {resolved_csv}")
+    resolved_performance_log = (
+        normalize_path(performance_log_path)
+        if performance_log_path is not None
+        else resolved_csv.parent / "performance_degradation.log"
+    )
 
     source_roots = discover_source_roots(
         user_data_root=resolved_user_data_root,
@@ -363,9 +467,8 @@ def analyze_profiling_roots(
         top_rows=top_rows,
         top_files=top_files,
         mod_hotspots=mod_hotspots,
-        performance_series=parse_performance_series(
-            resolved_csv.parent / "performance_degradation.log"
-        ),
+        performance_log_path=resolved_performance_log,
+        performance_series=parse_performance_series(resolved_performance_log),
     )
 
 
@@ -525,6 +628,27 @@ def parse_number(raw: object) -> float:
         return float(text)
     except ValueError:
         return 0.0
+
+
+def parse_game_date(raw: object) -> GameDate | None:
+    text = str(raw or "").strip()
+    match = GAME_DATE_RE.match(text)
+    if match is None:
+        return None
+    year = int(match.group("year"))
+    month = int(match.group("month"))
+    day = int(match.group("day"))
+    try:
+        parsed = date(year, month, day)
+    except ValueError:
+        return None
+    return GameDate(
+        raw=text,
+        year=year,
+        month=month,
+        day=day,
+        ordinal=parsed.toordinal(),
+    )
 
 
 def parse_performance_series(path: Path) -> PerformanceSeries | None:
@@ -872,6 +996,8 @@ def render_markdown_report(result: AnalysisResult) -> str:
             lines.append(f"- `{root.kind}` `{root.path}`")
         lines.append("")
 
+    lines.extend(_render_run_speed_markdown_section(result))
+
     lines.extend(
         [
             f"## Top Rows By {result.primary_metric.label}",
@@ -998,7 +1124,7 @@ def render_html_report(result: AnalysisResult) -> str:
         "</dl>",
         "</section>",
         _render_html_summary_cards(totals, mod_totals, result.row_count, len(mod_rows)),
-        _render_html_performance_section(result.performance_series),
+        _render_html_performance_section(result, mod_totals),
         _render_html_metric_notes_section(),
         _render_html_ownership_section(totals, ownership_totals),
         _render_html_system_section(system_impacts, totals),
@@ -1047,6 +1173,7 @@ def render_markdown_diff(before: AnalysisResult, after: AnalysisResult) -> str:
             f"| Mod {metric.label} | {_format_float(before_value)} | {_format_float(after_value)} | {_format_signed_float(after_value - before_value)} |"
         )
     lines.append("")
+    lines.extend(_render_run_speed_delta_table(before, after))
     lines.extend(_render_file_delta_table(before, after, title="Mod File Delta", top=max(before.top, after.top)))
     lines.extend(_render_rural_capacity_delta_table(before, after, top=max(before.top, after.top)))
     return "\n".join(lines).rstrip() + "\n"
@@ -1093,6 +1220,7 @@ def render_metadata_json(result: AnalysisResult) -> str:
             for impact in _mod_system_impacts(result)
         ],
         "performance": _performance_metadata(result.performance_series),
+        "run_speed": _run_speed_metadata(result, mod_totals=mod_totals),
         "script_block_impacts": [
             {
                 "block": impact.block,
@@ -1142,6 +1270,131 @@ def render_metadata_json(result: AnalysisResult) -> str:
         ],
     }
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
+
+
+def update_run_history(
+    result: AnalysisResult,
+    history_output: Path,
+    *,
+    history_report_output: Path | None = None,
+) -> Mapping[str, object]:
+    """Upsert one analysis result into persistent run-history files."""
+
+    history_path = normalize_path(history_output)
+    entry = _build_run_history_entry(result)
+    entries = {
+        str(existing.get("run_id")): existing
+        for existing in _read_run_history(history_path)
+        if existing.get("run_id")
+    }
+    entries[str(entry["run_id"])] = entry
+    ordered_entries = sorted(
+        entries.values(),
+        key=lambda item: str(item.get("generated_at", "")),
+    )
+
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    history_path.write_text(
+        "".join(
+            json.dumps(item, sort_keys=True) + "\n"
+            for item in ordered_entries
+        ),
+        encoding="utf-8",
+    )
+
+    if history_report_output is not None:
+        report_path = normalize_path(history_report_output)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            render_run_history_markdown(ordered_entries),
+            encoding="utf-8",
+        )
+
+    return entry
+
+
+def render_run_history_markdown(entries: Sequence[Mapping[str, object]]) -> str:
+    lines = [
+        "# EU5 Profiling Run History",
+        "",
+        "| Run ID | Generated | Rows | Mod Total | Seconds/Game Day | Game Days/Sec | Mod Total/Elapsed Sec | Mod Total/Game Day | Watched Blocks |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+    ]
+    for entry in entries:
+        run_speed = entry.get("run_speed") if isinstance(entry.get("run_speed"), dict) else {}
+        profiler_totals = (
+            entry.get("profiler_totals")
+            if isinstance(entry.get("profiler_totals"), dict)
+            else {}
+        )
+        mod_totals = (
+            profiler_totals.get("mod")
+            if isinstance(profiler_totals.get("mod"), dict)
+            else {}
+        )
+        blocks = entry.get("top_mod_script_blocks")
+        watched = []
+        if isinstance(blocks, (list, tuple)):
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                name = str(block.get("block", ""))
+                if name in HISTORY_WATCHED_BLOCKS:
+                    watched.append(name)
+        watched_label = ", ".join(dict.fromkeys(watched)) if watched else "n/a"
+        lines.append(
+            "| {run_id} | {generated} | {rows} | {mod_total} | {seconds_per_day} | {days_per_second} | {mod_per_second} | {mod_per_day} | {watched} |".format(
+                run_id=_escape_table(str(entry.get("run_id", ""))),
+                generated=_escape_table(str(entry.get("generated_at", ""))),
+                rows=_format_number(int(entry.get("row_count") or 0)),
+                mod_total=_format_float(float(mod_totals.get("total-time", 0.0))),
+                seconds_per_day=_format_float(float(run_speed.get("seconds_per_game_day", 0.0))),
+                days_per_second=_format_float(float(run_speed.get("game_days_per_second", 0.0))),
+                mod_per_second=_format_float(float(run_speed.get("mod_profiler_total_per_elapsed_second", 0.0))),
+                mod_per_day=_format_float(float(run_speed.get("mod_profiler_total_per_game_day", 0.0))),
+                watched=_escape_table(watched_label),
+            )
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _render_run_speed_markdown_section(result: AnalysisResult) -> list[str]:
+    series = result.performance_series
+    lines = [
+        "## Run Speed",
+        "",
+    ]
+    if series is None:
+        lines.extend(
+            [
+                "No `performance_degradation.log` was found for this capture, so gameplay-speed metrics are unavailable.",
+                "",
+            ]
+        )
+        return lines
+
+    speed = _run_speed_metadata(result)
+    lines.extend(
+        [
+            "| Metric | Value |",
+            "| --- | ---: |",
+            f"| Capture elapsed seconds | {_format_seconds(series.duration_seconds)} |",
+            f"| Gameplay elapsed seconds | {_format_seconds(series.gameplay_elapsed_seconds)} |",
+            f"| Game-date span | {_escape_table(_gameplay_span_label(series))} |",
+            f"| Game days elapsed | {_format_number(series.game_days_elapsed)} |",
+            f"| Seconds per game day | {_format_float(series.seconds_per_game_day)} |",
+            f"| Game days per second | {_format_float(series.game_days_per_second)} |",
+            f"| Mean gameplay Average Delta | {_format_delta(series.mean_gameplay_average_delta)} |",
+            f"| Bootstrap/non-gameplay samples ignored | {_format_number(series.bootstrap_sample_count)} |",
+            f"| Mod profiler total per elapsed second | {_format_float(float(speed['mod_profiler_total_per_elapsed_second']))} |",
+            f"| Mod profiler total per game day | {_format_float(float(speed['mod_profiler_total_per_game_day']))} |",
+            "",
+            "`1_01_01` and unparseable game-date samples are treated as bootstrap/non-gameplay rows for speed metrics.",
+            "",
+        ]
+    )
+    return lines
 
 
 def _render_script_block_markdown_section(result: AnalysisResult) -> list[str]:
@@ -1471,27 +1724,38 @@ def _render_html_summary_cards(
     return "\n".join(html_cards)
 
 
-def _render_html_performance_section(series: PerformanceSeries | None) -> str:
-    rows = ['<section class="panel">', "<h2>Run Statistics From performance_degradation.log</h2>"]
+def _render_html_performance_section(
+    result: AnalysisResult,
+    mod_totals: Mapping[str, float],
+) -> str:
+    series = result.performance_series
+    rows = ['<section class="panel">', "<h2>Run Speed From performance_degradation.log</h2>"]
     if series is None:
         rows.append(
-            "<p>No adjacent <code>performance_degradation.log</code> was found, so this report cannot show run-duration or frame-delta statistics.</p>"
+            "<p>No adjacent <code>performance_degradation.log</code> was found, so this report cannot show run-duration, game-day speed, or frame/update-delta statistics.</p>"
         )
         rows.append("</section>")
         return "\n".join(rows)
 
+    speed = _run_speed_metadata(result, mod_totals=mod_totals)
     rows.append(
-        "<p>The script profiler CSV does not contain total run seconds or tick count. This adjacent log provides elapsed seconds and frame/update delta samples; tick count is not explicit, so the frame/tick value below is an estimate from delta samples.</p>"
+        "<p>The script profiler CSV does not contain simulation speed. This adjacent log provides elapsed seconds, game-date samples, and frame/update delta samples. Bootstrap rows such as <code>1_01_01</code> are ignored for gameplay-speed metrics.</p>"
     )
     rows.extend(
         [
             '<div class="cards stats-cards">',
             _html_stat_card("Samples", _format_number(series.sample_count), "Rows in performance_degradation.log."),
-            _html_stat_card("Elapsed", _format_seconds(series.duration_seconds), f"{_h(series.first_game_date)} to {_h(series.last_game_date)}."),
-            _html_stat_card("Mean Avg Delta", _format_delta(series.mean_average_delta), "Average of logged Average Delta values."),
+            _html_stat_card("Capture Elapsed", _format_seconds(series.duration_seconds), f"{_h(series.first_game_date)} to {_h(series.last_game_date)}."),
+            _html_stat_card("Gameplay Elapsed", _format_seconds(series.gameplay_elapsed_seconds), _h(_gameplay_span_label(series))),
+            _html_stat_card("Seconds/Game Day", _format_float(series.seconds_per_game_day), "Elapsed real seconds divided by game-date day span."),
+            _html_stat_card("Game Days/Sec", _format_float(series.game_days_per_second), "Game-date day span divided by elapsed real seconds."),
+            _html_stat_card("Mean Gameplay Delta", _format_delta(series.mean_gameplay_average_delta), "Average Delta after bootstrap/non-gameplay rows are ignored."),
+            _html_stat_card("Mod Total / Elapsed Sec", _format_float(float(speed["mod_profiler_total_per_elapsed_second"])), "Resolved mod profiler total divided by capture elapsed seconds."),
+            _html_stat_card("Mod Total / Game Day", _format_float(float(speed["mod_profiler_total_per_game_day"])), "Resolved mod profiler total divided by game days elapsed."),
+            _html_stat_card("Bootstrap Samples", _format_number(series.bootstrap_sample_count), "Rows ignored for gameplay-speed metrics."),
             _html_stat_card("Worst Max Delta", _format_delta(series.max_delta), "Largest logged MaxDelta spike."),
             _html_stat_card("Best Min Delta", _format_delta(series.min_delta), "Smallest logged MinDelta."),
-            _html_stat_card("Estimated Frames/Ticks", _format_float(series.estimated_frames_or_ticks), "Derived from sample span divided by Average Delta, not directly exported."),
+            _html_stat_card("Estimated Frames/Updates", _format_float(series.estimated_frames_or_updates), "Derived from sample span divided by Average Delta; this is not a real tick export."),
             "</div>",
             _render_performance_svg(series),
             "</section>",
@@ -1511,7 +1775,7 @@ def _render_html_metric_notes_section() -> str:
             '<li><strong>Self Time</strong>: interpreted as exclusive accumulated time spent directly in that row, excluding nested work.</li>',
             '<li><strong>Bottleneck Time</strong>: Paradox-specific column name with no public definition found. This report treats it as a blocking-pressure signal and keeps it separate from Total Time for next-action decisions.</li>',
             '<li><strong>Call Count</strong>: number of times the profiled script row was invoked during the captured profiling window.</li>',
-            '<li><strong>Total seconds/ticks</strong>: not present in <code>profiling_roots.csv</code>. Elapsed seconds and delta statistics come from <code>performance_degradation.log</code>; ticks are estimated only when shown.</li>',
+            '<li><strong>Run speed</strong>: not present in <code>profiling_roots.csv</code>. Elapsed seconds, game-date span, and delta statistics come from <code>performance_degradation.log</code>; estimated frames/updates are derived from delta samples and are not real exported game ticks.</li>',
             "</ul>",
             '<p class="source-links">Sources checked: <a href="https://ck3.paradoxwikis.com/Patch_1.13">CK3 Patch 1.13 Script Profiler note</a>, <a href="https://developer.chrome.com/docs/devtools/performance/reference">Chrome DevTools profiler self/total definitions</a>.</p>',
             "</section>",
@@ -1762,6 +2026,40 @@ def _render_html_source_status_section(
     return "\n".join(rows)
 
 
+def _render_run_speed_delta_table(
+    before: AnalysisResult,
+    after: AnalysisResult,
+) -> list[str]:
+    if before.performance_series is None and after.performance_series is None:
+        return []
+    before_speed = _run_speed_metadata(before)
+    after_speed = _run_speed_metadata(after)
+    metrics = (
+        ("Capture elapsed seconds", "capture_elapsed_seconds"),
+        ("Gameplay elapsed seconds", "gameplay_elapsed_seconds"),
+        ("Game days elapsed", "game_days_elapsed"),
+        ("Seconds/Game Day", "seconds_per_game_day"),
+        ("Game Days/Sec", "game_days_per_second"),
+        ("Mean gameplay Average Delta", "mean_gameplay_average_delta"),
+        ("Mod profiler total per elapsed second", "mod_profiler_total_per_elapsed_second"),
+        ("Mod profiler total per game day", "mod_profiler_total_per_game_day"),
+    )
+    lines = [
+        "## Run Speed Delta",
+        "",
+        "| Metric | Before | After | Delta |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    for label, key in metrics:
+        before_value = float(before_speed.get(key, 0.0))
+        after_value = float(after_speed.get(key, 0.0))
+        lines.append(
+            f"| {label} | {_format_float(before_value)} | {_format_float(after_value)} | {_format_signed_float(after_value - before_value)} |"
+        )
+    lines.append("")
+    return lines
+
+
 def _render_file_delta_table(
     before: AnalysisResult,
     after: AnalysisResult,
@@ -1900,10 +2198,18 @@ def _performance_metadata(series: PerformanceSeries | None) -> Mapping[str, obje
         "duration_seconds": series.duration_seconds,
         "first_game_date": series.first_game_date,
         "last_game_date": series.last_game_date,
+        "bootstrap_sample_count": series.bootstrap_sample_count,
+        "gameplay_start_date": series.gameplay_start_date,
+        "gameplay_end_date": series.gameplay_end_date,
+        "gameplay_elapsed_seconds": series.gameplay_elapsed_seconds,
+        "game_days_elapsed": series.game_days_elapsed,
+        "seconds_per_game_day": series.seconds_per_game_day,
+        "game_days_per_second": series.game_days_per_second,
         "mean_average_delta": series.mean_average_delta,
+        "mean_gameplay_average_delta": series.mean_gameplay_average_delta,
         "min_delta": series.min_delta,
         "max_delta": series.max_delta,
-        "estimated_frames_or_ticks": series.estimated_frames_or_ticks,
+        "estimated_frames_or_updates": series.estimated_frames_or_updates,
         "first_sample": _performance_sample_metadata(samples[0]) if samples else None,
         "last_sample": _performance_sample_metadata(samples[-1]) if samples else None,
         "extra_numeric_summary": series.extra_numeric_summary,
@@ -1919,6 +2225,150 @@ def _performance_sample_metadata(sample: PerformanceSample) -> Mapping[str, obje
         "game_date": sample.game_date,
         "extra_values": dict(sample.extra_values),
     }
+
+
+def _run_speed_metadata(
+    result: AnalysisResult,
+    *,
+    mod_totals: Mapping[str, float] | None = None,
+) -> Mapping[str, object]:
+    series = result.performance_series
+    if mod_totals is None:
+        mod_totals = _ownership_metric_totals(result.rows).get("mod", _empty_metric_totals())
+    mod_total = mod_totals["Total Time"]
+    if series is None:
+        return {
+            "available": False,
+            "performance_log": _path_metadata(_performance_log_path(result)),
+            "capture_elapsed_seconds": 0.0,
+            "gameplay_start_date": "",
+            "gameplay_end_date": "",
+            "gameplay_elapsed_seconds": 0.0,
+            "game_days_elapsed": 0,
+            "seconds_per_game_day": 0.0,
+            "game_days_per_second": 0.0,
+            "mean_gameplay_average_delta": 0.0,
+            "bootstrap_sample_count": 0,
+            "mod_profiler_total": mod_total,
+            "mod_profiler_total_per_elapsed_second": 0.0,
+            "mod_profiler_total_per_game_day": 0.0,
+        }
+    return {
+        "available": series.game_days_elapsed > 0 and series.gameplay_elapsed_seconds > 0,
+        "performance_log": _path_metadata(series.path),
+        "capture_elapsed_seconds": series.duration_seconds,
+        "gameplay_start_date": series.gameplay_start_date,
+        "gameplay_end_date": series.gameplay_end_date,
+        "gameplay_elapsed_seconds": series.gameplay_elapsed_seconds,
+        "game_days_elapsed": series.game_days_elapsed,
+        "seconds_per_game_day": series.seconds_per_game_day,
+        "game_days_per_second": series.game_days_per_second,
+        "mean_gameplay_average_delta": series.mean_gameplay_average_delta,
+        "bootstrap_sample_count": series.bootstrap_sample_count,
+        "mod_profiler_total": mod_total,
+        "mod_profiler_total_per_elapsed_second": _safe_div(mod_total, series.duration_seconds),
+        "mod_profiler_total_per_game_day": _safe_div(mod_total, float(series.game_days_elapsed)),
+    }
+
+
+def _build_run_history_entry(result: AnalysisResult) -> Mapping[str, object]:
+    totals = _metric_totals(result.rows)
+    ownership_totals = _ownership_metric_totals(result.rows)
+    mod_totals = ownership_totals.get("mod", _empty_metric_totals())
+    vanilla_totals = ownership_totals.get("vanilla", _empty_metric_totals())
+    unknown_totals = ownership_totals.get("unknown", _empty_metric_totals())
+    performance_log = _performance_log_path(result)
+    top_blocks = _selected_history_script_blocks(script_block_impacts(result.rows))
+    return {
+        "schema_version": HISTORY_SCHEMA_VERSION,
+        "run_id": _run_history_id(result, performance_log),
+        "generated_at": result.generated_at.astimezone(UTC).isoformat(),
+        "csv": _path_metadata(result.csv_path),
+        "performance_log": _path_metadata(performance_log),
+        "row_count": result.row_count,
+        "primary_metric": result.primary_metric.key,
+        "profiler_totals": {
+            "all": _json_metric_totals(totals),
+            "mod": _json_metric_totals(mod_totals),
+            "vanilla": _json_metric_totals(vanilla_totals),
+            "unknown": _json_metric_totals(unknown_totals),
+        },
+        "run_speed": _run_speed_metadata(result, mod_totals=mod_totals),
+        "top_mod_script_blocks": [
+            _history_script_block_metadata(block)
+            for block in top_blocks
+        ],
+    }
+
+
+def _selected_history_script_blocks(
+    blocks: Sequence[ScriptBlockImpact],
+    *,
+    top: int = 10,
+) -> tuple[ScriptBlockImpact, ...]:
+    selected: list[ScriptBlockImpact] = []
+    seen: set[tuple[str, str]] = set()
+    for block in (*blocks[:top], *blocks):
+        if len(selected) >= top and block.block not in HISTORY_WATCHED_BLOCKS:
+            continue
+        key = (block.source_path, block.block)
+        if key in seen:
+            continue
+        if len(selected) < top or block.block in HISTORY_WATCHED_BLOCKS:
+            selected.append(block)
+            seen.add(key)
+    return tuple(selected)
+
+
+def _history_script_block_metadata(block: ScriptBlockImpact) -> Mapping[str, object]:
+    return {
+        "block": block.block,
+        "source_path": block.source_path,
+        "row_count": block.row_count,
+        "metrics": _json_metric_totals(block.values),
+    }
+
+
+def _run_history_id(result: AnalysisResult, performance_log: Path) -> str:
+    basis = {
+        "csv": _path_metadata(result.csv_path),
+        "performance_log": _path_metadata(performance_log),
+    }
+    raw = json.dumps(basis, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:20]
+
+
+def _read_run_history(path: Path) -> tuple[Mapping[str, object], ...]:
+    if not path.is_file():
+        return ()
+    entries: list[Mapping[str, object]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            entries.append(payload)
+    return tuple(entries)
+
+
+def _performance_log_path(result: AnalysisResult) -> Path:
+    if result.performance_series is not None:
+        return result.performance_series.path
+    if result.performance_log_path is not None:
+        return result.performance_log_path
+    return result.csv_path.parent / "performance_degradation.log"
+
+
+def _gameplay_span_label(series: PerformanceSeries) -> str:
+    if not series.gameplay_start_date or not series.gameplay_end_date:
+        return "unavailable"
+    return (
+        f"{series.gameplay_start_date} to {series.gameplay_end_date} "
+        f"({_format_number(series.game_days_elapsed)} days)"
+    )
 
 
 def _metric_totals(rows: Sequence[ProfilingRow]) -> Mapping[str, float]:

@@ -20,6 +20,31 @@ From this repository:
 uv run pp-profile profiling-roots analyze
 ```
 
+For normal Prosper or Perish profiling work, use the one-command workflow:
+
+```bash
+uv run pp-profile profiling-roots latest
+```
+
+`latest` reads `pp-profile.local.toml` or `pp-profile.toml` when present,
+copies the current live EU5 logs into `reports/captures/<timestamp>/`, writes
+timestamped Markdown/HTML/JSON reports, updates run history, and diffs against
+the previous frozen capture by default. Use `--no-diff-previous` when you only
+want the fresh report.
+
+Example local config:
+
+```toml
+[profiling_roots]
+user_data_root = "/mnt/c/Users/Anwender/Documents/Paradox Interactive/Europa Universalis V"
+load_order = "../ProsperOrPerishConstructor/constructor.load_order.toml"
+report_prefix = "rural_capacity_profile"
+top = 100
+diff_previous = true
+```
+
+`pp-profile.local.toml` is ignored by git, so machine-local paths stay local.
+
 By default, the command searches standard EU5 user-data locations, including WSL
 paths such as:
 
@@ -49,21 +74,52 @@ building capacity formulas, building definitions, employment priorities, and
 on-action/culling logic. Its mod file and mod row drill-down tables include all
 resolved mod-owned entries from the export, with seconds plus percent-of-all
 and percent-of-mod columns. When `logs/performance_degradation.log` is present
-next to the profiling CSV, the HTML report also includes elapsed-time and
-frame/update-delta statistics with an inline graph. Markdown and HTML reports
-also include rural-capacity callsite rollups, building surface breakdowns,
-fruit-orchard focus tables, and likely duplicate `max_levels`/`allow` capacity
-evaluations. The JSON sidecar stores machine-readable run metadata, including
-CSV file stats, performance-log sample count, elapsed seconds, estimated
-frames/ticks, game-date span, frame/update deltas, memory, GUI widget, and ECS
-summaries when those columns are present.
+next to the profiling CSV, the reports also include a Run Speed section with
+capture elapsed seconds, gameplay elapsed seconds, game-day span, seconds per
+game day, game days per second, frame/update-delta statistics, and an inline
+HTML graph. Bootstrap rows such as `1_01_01` are ignored for gameplay-speed
+metrics. Markdown and HTML reports also include rural-capacity callsite rollups,
+building surface breakdowns, fruit-orchard focus tables, and likely duplicate
+`max_levels`/`allow` capacity evaluations. The JSON sidecar stores
+machine-readable run metadata, including CSV file stats, performance-log sample
+count, elapsed seconds, estimated frames/updates, game-date speed, memory, GUI
+widget, and ECS summaries when those columns are present.
+
+Use a non-adjacent performance log explicitly:
+
+```bash
+uv run pp-profile profiling-roots analyze \
+  --csv reports/current/profiling_roots.csv \
+  --performance-log reports/current/performance_degradation.log \
+  --output reports/current/profiling_roots.md
+```
+
+When a Markdown report is written to a file, analysis also updates run history
+at these default paths:
+
+```text
+reports/profiling_run_history.jsonl
+reports/profiling_run_history.md
+```
+
+Override or disable history tracking:
+
+```bash
+uv run pp-profile profiling-roots analyze \
+  --history-output reports/profiling_run_history.jsonl \
+  --history-report-output reports/profiling_run_history.md
+
+uv run pp-profile profiling-roots analyze --no-history
+```
 
 Compare two profiling captures:
 
 ```bash
 uv run pp-profile profiling-roots diff \
   --before-csv reports/before/profiling_roots.csv \
+  --before-performance-log reports/before/performance_degradation.log \
   --after-csv reports/after/profiling_roots.csv \
+  --after-performance-log reports/after/performance_degradation.log \
   --output reports/profiling_roots_diff.md
 ```
 

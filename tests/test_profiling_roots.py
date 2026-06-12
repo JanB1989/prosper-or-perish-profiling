@@ -64,20 +64,79 @@ def test_parse_performance_series_reads_elapsed_and_delta_stats(tmp_path: Path) 
     path = tmp_path / "performance_degradation.log"
     path.write_text(
         '"Total Time","Average Delta","MinDelta","MaxDelta","Game Data"\n'
-        '"0.0","0.020","0.010","0.030","1444_01_01"\n'
-        '"10.0","0.040","0.015","0.100","1444_02_01"\n',
+        '"0.0","0.020","0.010","0.030","1_01_01"\n'
+        '"2.0","0.030","0.010","0.050","not_a_date"\n'
+        '"10.0","0.040","0.015","0.100","1444_01_01"\n'
+        '"30.0","0.080","0.020","0.200","1444_01_11"\n',
         encoding="utf-8",
     )
 
     series = parse_performance_series(path)
 
     assert series is not None
-    assert series.sample_count == 2
-    assert series.duration_seconds == 10
-    assert series.mean_average_delta == 0.03
-    assert series.max_delta == 0.1
-    assert series.first_game_date == "1444_01_01"
-    assert series.last_game_date == "1444_02_01"
+    assert series.sample_count == 4
+    assert series.duration_seconds == 30
+    assert series.mean_average_delta == 0.0425
+    assert series.max_delta == 0.2
+    assert series.first_game_date == "1_01_01"
+    assert series.last_game_date == "1444_01_11"
+    assert series.bootstrap_sample_count == 2
+    assert series.gameplay_start_date == "1444_01_01"
+    assert series.gameplay_end_date == "1444_01_11"
+    assert series.gameplay_elapsed_seconds == 20
+    assert series.game_days_elapsed == 10
+    assert series.seconds_per_game_day == 2
+    assert series.game_days_per_second == 0.5
+    assert series.mean_gameplay_average_delta == 0.06
+
+
+def test_parse_performance_series_marks_speed_unavailable_with_one_gameplay_sample(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "performance_degradation.log"
+    path.write_text(
+        '"Total Time","Average Delta","MinDelta","MaxDelta","Game Data"\n'
+        '"0.0","0.020","0.010","0.030","1_01_01"\n'
+        '"10.0","0.040","0.015","0.100","1444_01_01"\n',
+        encoding="utf-8",
+    )
+
+    series = parse_performance_series(path)
+
+    assert series is not None
+    assert series.bootstrap_sample_count == 1
+    assert series.gameplay_start_date == "1444_01_01"
+    assert series.gameplay_end_date == "1444_01_01"
+    assert series.game_days_elapsed == 0
+    assert series.gameplay_elapsed_seconds == 0
+    assert series.seconds_per_game_day == 0
+    assert series.game_days_per_second == 0
+
+
+def test_parse_performance_series_ignores_trailing_duplicate_final_date_for_speed(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "performance_degradation.log"
+    path.write_text(
+        '"Total Time","Average Delta","MinDelta","MaxDelta","Game Data"\n'
+        '"0.0","0.020","0.010","0.030","1_01_01"\n'
+        '"10.0","0.040","0.015","0.100","1444_01_01"\n'
+        '"20.0","0.080","0.020","0.200","1444_01_11"\n'
+        '"120.0","0.030","0.020","0.050","1444_01_11"\n',
+        encoding="utf-8",
+    )
+
+    series = parse_performance_series(path)
+
+    assert series is not None
+    assert len(series.gameplay_samples) == 3
+    assert len(series.gameplay_speed_samples) == 2
+    assert series.gameplay_end_date == "1444_01_11"
+    assert series.gameplay_elapsed_seconds == 10
+    assert series.game_days_elapsed == 10
+    assert series.seconds_per_game_day == 1
+    assert series.game_days_per_second == 1
+    assert series.mean_gameplay_average_delta == 0.06
 
 
 def test_parse_performance_series_preserves_extra_numeric_columns(tmp_path: Path) -> None:
@@ -235,9 +294,10 @@ def test_render_html_report_visualizes_mod_impact_and_blocking(tmp_path: Path) -
     assert "Bottleneck Time" in report
     assert "Total Time</th><th>% All Total</th><th>% Mod Total" in report
     assert "12 s" in report
-    assert "Run Statistics From performance_degradation.log" in report
+    assert "Run Speed From performance_degradation.log" in report
+    assert "Seconds/Game Day" in report
     assert "Performance delta over elapsed run seconds" in report
-    assert "Estimated Frames/Ticks" in report
+    assert "Estimated Frames/Updates" in report
     assert "Profiler Metric Notes" in report
     assert "common/script_values/pp_building_caps.txt" in report
 
@@ -349,8 +409,12 @@ def test_render_markdown_diff_includes_mod_and_rural_capacity_deltas(tmp_path: P
     source = mod_root / "in_game" / "common" / "script_values" / "pp_farming_capacity.txt"
     source.parent.mkdir(parents=True)
     source.write_text("farm_capacity = {\n\tvalue = 1\n}\n", encoding="utf-8")
-    before_csv = tmp_path / "before.csv"
-    after_csv = tmp_path / "after.csv"
+    before_dir = tmp_path / "before"
+    after_dir = tmp_path / "after"
+    before_dir.mkdir()
+    after_dir.mkdir()
+    before_csv = before_dir / "profiling_roots.csv"
+    after_csv = after_dir / "profiling_roots.csv"
     write_csv(
         before_csv,
         ["named_script_value @ common/script_values/pp_farming_capacity.txt:1;0;100;0;0;5;20;0;0\n"],
@@ -359,12 +423,28 @@ def test_render_markdown_diff_includes_mod_and_rural_capacity_deltas(tmp_path: P
         after_csv,
         ["named_script_value @ common/script_values/pp_farming_capacity.txt:1;0;100;0;0;3;12;0;0\n"],
     )
+    (before_dir / "performance_degradation.log").write_text(
+        '"Total Time","Average Delta","MinDelta","MaxDelta","Game Data"\n'
+        '"0.0","0.020","0.010","0.030","1_01_01"\n'
+        '"10.0","0.040","0.015","0.100","1444_01_01"\n'
+        '"30.0","0.040","0.015","0.100","1444_01_11"\n',
+        encoding="utf-8",
+    )
+    (after_dir / "performance_degradation.log").write_text(
+        '"Total Time","Average Delta","MinDelta","MaxDelta","Game Data"\n'
+        '"0.0","0.020","0.010","0.030","1_01_01"\n'
+        '"8.0","0.030","0.015","0.080","1444_01_01"\n'
+        '"18.0","0.030","0.015","0.080","1444_01_11"\n',
+        encoding="utf-8",
+    )
 
     before = analyze_profiling_roots(csv_path=before_csv, mod_roots=[mod_root], top=5)
     after = analyze_profiling_roots(csv_path=after_csv, mod_roots=[mod_root], top=5)
     report = render_markdown_diff(before, after)
 
     assert "EU5 Profiling Roots Diff" in report
+    assert "Run Speed Delta" in report
+    assert "Seconds/Game Day" in report
     assert "Mod File Delta" in report
     assert "Rural Capacity Callsite Delta" in report
     assert "-8" in report
@@ -384,8 +464,9 @@ def test_render_metadata_json_includes_performance_and_rural_sections(tmp_path: 
     )
     (logs / "performance_degradation.log").write_text(
         '"Total Time","Average Delta","MinDelta","MaxDelta","Game Data","GUI widgets"\n'
-        '"0.0","0.020","0.010","0.030","1444_01_01","100"\n'
-        '"10.0","0.040","0.015","0.100","1444_02_01","140"\n',
+        '"0.0","0.020","0.010","0.030","1_01_01","100"\n'
+        '"10.0","0.040","0.015","0.100","1444_01_01","120"\n'
+        '"30.0","0.040","0.015","0.100","1444_01_11","140"\n',
         encoding="utf-8",
     )
 
@@ -393,7 +474,13 @@ def test_render_metadata_json_includes_performance_and_rural_sections(tmp_path: 
     payload = json.loads(render_metadata_json(result))
 
     assert payload["row_count"] == 1
-    assert payload["performance"]["sample_count"] == 2
-    assert payload["performance"]["estimated_frames_or_ticks"] > 0
+    assert payload["performance"]["sample_count"] == 3
+    assert payload["performance"]["bootstrap_sample_count"] == 1
+    assert payload["performance"]["gameplay_start_date"] == "1444_01_01"
+    assert payload["performance"]["game_days_elapsed"] == 10
+    assert payload["performance"]["seconds_per_game_day"] == 2
+    assert payload["performance"]["estimated_frames_or_updates"] > 0
     assert payload["performance"]["extra_numeric_summary"]["GUI widgets"]["last"] == 140
+    assert payload["run_speed"]["mod_profiler_total_per_elapsed_second"] > 0
+    assert payload["run_speed"]["mod_profiler_total_per_game_day"] == 2
     assert payload["rural_capacity_callsites"][0]["capacity"] == "farm_capacity"
